@@ -221,15 +221,7 @@ static void dfn3_gru_cell(
     int input_size,
     float* restrict tmp          /* scratch [4*H] */
 ) {
-    /* Pointers into W, R, B */
-    const float* Wz = W;
-    const float* Wr = W + H * input_size;
-    const float* Wh = W + 2 * H * input_size;
-
-    const float* Rz = R;
-    const float* Rr = R + H * H;
-    const float* Rh = R + 2 * H * H;
-
+    /* Pointers into B */
     const float* Wbz = B;
     const float* Wbr = B + H;
     const float* Wbh = B + 2 * H;
@@ -237,26 +229,34 @@ static void dfn3_gru_cell(
     const float* Rbr = B + 4 * H;
     const float* Rbh = B + 5 * H;
 
-    float* z = tmp;
-    float* r = tmp + H;
-    float* h_hat = tmp + 2 * H;
-    float* rh = tmp + 3 * H;
+    float* z = tmp;              /* [H] */
+    float* r = tmp + H;          /* [H] */
+    float* h_hat = tmp + 2 * H;  /* [H] */
+    float* rh = tmp + 3 * H;     /* [H] — reused */
 
-    /* z = Wz*x */
-    dfn3_matvec(z, Wz, x, H, input_size);
-    /* z += Rz*h */
-    dfn3_matvec_add(z, Rz, h, H, H);
-    /* z[i] = sigmoid(z[i] + Wbz[i] + Rbz[i]) */
+    /* --- Fused gate computation: W[3H, input] * x → [z, r, h_hat_wx] --- */
+    /* Single pass over x, 3x better cache reuse than 3 separate matvecs */
+    dfn3_matvec(tmp, W, x, 3 * H, input_size);
+    /* tmp now has: [Wz*x (H) | Wr*x (H) | Wh*x (H)] in z, r, h_hat */
+
+    /* --- Fused: R[3H, H] * h → rh buffer (reuse scratch3 from caller) --- */
+    /* Need separate buffer for R*h since we need all 3 slices */
+    float gates_h[768];  /* 3 * H = 3 * 256 = 768 max */
+    dfn3_matvec(gates_h, R, h, 3 * H, H);
+    /* gates_h: [Rz*h (H) | Rr*h (H) | Rh*h (H)] */
+
+    /* --- z = sigmoid(Wz*x + Rz*h + Wbz + Rbz) --- */
+    /* z already has Wz*x, add Rz*h */
 #if DFN3_SIMD
     {
         int i = 0;
         int H4 = H & ~3;
         for (; i < H4; i += 4) {
             v128_t vz = wasm_v128_load(z + i);
+            v128_t vrh = wasm_v128_load(gates_h + i);
             v128_t vwb = wasm_v128_load(Wbz + i);
             v128_t vrb = wasm_v128_load(Rbz + i);
-            vz = wasm_f32x4_add(vz, wasm_f32x4_add(vwb, vrb));
-            /* Scalar sigmoid — SIMD add saves 2 loads + adds per 4 elements */
+            vz = wasm_f32x4_add(wasm_f32x4_add(vz, vrh), wasm_f32x4_add(vwb, vrb));
             for (int k = 0; k < 4; k++) {
                 float v = wasm_f32x4_extract_lane(vz, 0);
                 z[i + k] = dfn3_sigmoid(v);
@@ -264,28 +264,27 @@ static void dfn3_gru_cell(
             }
         }
         for (; i < H; i++) {
-            z[i] = dfn3_sigmoid(z[i] + Wbz[i] + Rbz[i]);
+            z[i] = dfn3_sigmoid(z[i] + gates_h[i] + Wbz[i] + Rbz[i]);
         }
     }
 #else
     for (int i = 0; i < H; i++) {
-        z[i] = dfn3_sigmoid(z[i] + Wbz[i] + Rbz[i]);
+        z[i] = dfn3_sigmoid(z[i] + gates_h[i] + Wbz[i] + Rbz[i]);
     }
 #endif
 
-    /* r = Wr*x */
-    dfn3_matvec(r, Wr, x, H, input_size);
-    dfn3_matvec_add(r, Rr, h, H, H);
-    /* r[i] = sigmoid(r[i] + Wbr[i] + Rbr[i]) */
+    /* --- r = sigmoid(Wr*x + Rr*h + Wbr + Rbr) --- */
+    /* r already has Wr*x, add Rr*h */
 #if DFN3_SIMD
     {
         int i = 0;
         int H4 = H & ~3;
         for (; i < H4; i += 4) {
             v128_t vr = wasm_v128_load(r + i);
+            v128_t vrh = wasm_v128_load(gates_h + H + i);
             v128_t vwb = wasm_v128_load(Wbr + i);
             v128_t vrb = wasm_v128_load(Rbr + i);
-            vr = wasm_f32x4_add(vr, wasm_f32x4_add(vwb, vrb));
+            vr = wasm_f32x4_add(wasm_f32x4_add(vr, vrh), wasm_f32x4_add(vwb, vrb));
             for (int k = 0; k < 4; k++) {
                 float v = wasm_f32x4_extract_lane(vr, 0);
                 r[i + k] = dfn3_sigmoid(v);
@@ -293,19 +292,17 @@ static void dfn3_gru_cell(
             }
         }
         for (; i < H; i++) {
-            r[i] = dfn3_sigmoid(r[i] + Wbr[i] + Rbr[i]);
+            r[i] = dfn3_sigmoid(r[i] + gates_h[H + i] + Wbr[i] + Rbr[i]);
         }
     }
 #else
     for (int i = 0; i < H; i++) {
-        r[i] = dfn3_sigmoid(r[i] + Wbr[i] + Rbr[i]);
+        r[i] = dfn3_sigmoid(r[i] + gates_h[H + i] + Wbr[i] + Rbr[i]);
     }
 #endif
 
-    /* linear_before_reset=1: rh = Rh*h, h_hat = Wh*x */
-    dfn3_matvec(rh, Rh, h, H, H);
-    dfn3_matvec(h_hat, Wh, x, H, input_size);
-    /* h_hat[i] = tanh(h_hat[i] + Wbh[i] + r[i] * (rh[i] + Rbh[i])) */
+    /* --- h_hat = tanh(Wh*x + Wbh + r * (Rh*h + Rbh)) --- */
+    /* h_hat already has Wh*x, gates_h+2H has Rh*h */
 #if DFN3_SIMD
     {
         int i = 0;
@@ -314,9 +311,8 @@ static void dfn3_gru_cell(
             v128_t vh = wasm_v128_load(h_hat + i);
             v128_t vwb = wasm_v128_load(Wbh + i);
             v128_t vr = wasm_v128_load(r + i);
-            v128_t vrh = wasm_v128_load(rh + i);
+            v128_t vrh = wasm_v128_load(gates_h + 2 * H + i);
             v128_t vRbh = wasm_v128_load(Rbh + i);
-            /* h_hat + Wbh + r * (rh + Rbh) */
             v128_t val = wasm_f32x4_add(vh, wasm_f32x4_add(vwb,
                 wasm_f32x4_mul(vr, wasm_f32x4_add(vrh, vRbh))));
             for (int k = 0; k < 4; k++) {
@@ -326,12 +322,12 @@ static void dfn3_gru_cell(
             }
         }
         for (; i < H; i++) {
-            h_hat[i] = tanhf(h_hat[i] + Wbh[i] + r[i] * (rh[i] + Rbh[i]));
+            h_hat[i] = tanhf(h_hat[i] + Wbh[i] + r[i] * (gates_h[2 * H + i] + Rbh[i]));
         }
     }
 #else
     for (int i = 0; i < H; i++) {
-        h_hat[i] = tanhf(h_hat[i] + Wbh[i] + r[i] * (rh[i] + Rbh[i]));
+        h_hat[i] = tanhf(h_hat[i] + Wbh[i] + r[i] * (gates_h[2 * H + i] + Rbh[i]));
     }
 #endif
 
@@ -428,7 +424,9 @@ static void dfn3_depthwise_conv2d(
  * Bias:   [C_out] (can be NULL)
  * Output: [C_out, W]
  *
- * SIMD: inner ci loop uses 4-wide dot product.
+ * Optimized: transpose input [C_in, W] → [W, C_in] so the inner
+ * dot-product over C_in is contiguous, enabling full SIMD throughput.
+ * Max input size: 64 × 96 = 6144 floats = 24 KB (fits on stack).
  */
 static void dfn3_pointwise_conv2d(
     float* restrict out,
@@ -437,44 +435,23 @@ static void dfn3_pointwise_conv2d(
     const float* restrict bias,
     int C_in, int C_out, int W
 ) {
-#if DFN3_SIMD
-    int C4 = C_in & ~3;
+    /* Transpose [C_in, W] → [W, C_in] for contiguous dot products */
+    float in_t[6144];  /* max 64 × 96 */
+    for (int ci = 0; ci < C_in; ci++) {
+        const float* src = in + ci * W;
+        for (int w = 0; w < W; w++) {
+            in_t[w * C_in + ci] = src[w];
+        }
+    }
+
     for (int co = 0; co < C_out; co++) {
         const float* w_row = weight + co * C_in;
         float b = bias ? bias[co] : 0.0f;
         for (int w = 0; w < W; w++) {
-            v128_t acc = wasm_f32x4_splat(0.0f);
-            int ci = 0;
-            for (; ci < C4; ci += 4) {
-                v128_t vw = wasm_v128_load(w_row + ci);
-                /* Gather in[ci*W+w] .. in[(ci+3)*W+w] — not contiguous */
-                v128_t vi = wasm_f32x4_make(
-                    in[ci * W + w],
-                    in[(ci + 1) * W + w],
-                    in[(ci + 2) * W + w],
-                    in[(ci + 3) * W + w]);
-                acc = wasm_f32x4_add(acc, wasm_f32x4_mul(vw, vi));
-            }
-            float sum = b + dfn3_hsum_f32x4(acc);
-            for (; ci < C_in; ci++) {
-                sum += w_row[ci] * in[ci * W + w];
-            }
-            out[co * W + w] = sum;
+            /* Now in_t[w * C_in ..] is contiguous over C_in → fast vdot */
+            out[co * W + w] = b + dfn3_vdot(w_row, in_t + w * C_in, C_in);
         }
     }
-#else
-    for (int co = 0; co < C_out; co++) {
-        const float* w_row = weight + co * C_in;
-        float b = bias ? bias[co] : 0.0f;
-        for (int w = 0; w < W; w++) {
-            float sum = b;
-            for (int ci = 0; ci < C_in; ci++) {
-                sum += w_row[ci] * in[ci * W + w];
-            }
-            out[co * W + w] = sum;
-        }
-    }
-#endif
 }
 
 /*

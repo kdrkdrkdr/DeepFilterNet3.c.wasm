@@ -963,24 +963,42 @@ static void dfn3_df_decoder(DFN3State* st) {
             for (int co = 0; co < C_out_per_group; co++) {
                 int co_abs = g * C_out_per_group + co;
                 const float* wt = w->df_convp_dw_w.data + co_abs * C_in_per_group * kH * kW;
+                float* dst = dw_out + co_abs * W_freq;
 
-                for (int ow = 0; ow < W_freq; ow++) {
-                    float sum = 0.0f;
-                    for (int ci = 0; ci < C_in_per_group; ci++) {
-                        int ci_abs = g * C_in_per_group + ci;
-                        for (int kh = 0; kh < kH; kh++) {
-                            const float* src;
-                            if (kh < 4) {
-                                /* From temporal padding buffer */
-                                src = pad + ci_abs * 4 * W_freq + kh * W_freq;
-                            } else {
-                                /* Current frame */
-                                src = st->c0 + ci_abs * W_freq;
-                            }
-                            sum += src[ow] * wt[(ci * kH + kh) * kW];
+                /* Zero output for accumulation */
+                memset(dst, 0, W_freq * sizeof(float));
+
+                /* Accumulate: for each input channel and temporal tap,
+                   multiply contiguous frequency vector by scalar weight.
+                   src[ow] is stride-1 along freq → perfect for SIMD. */
+                for (int ci = 0; ci < C_in_per_group; ci++) {
+                    int ci_abs = g * C_in_per_group + ci;
+                    for (int kh = 0; kh < kH; kh++) {
+                        const float* src;
+                        if (kh < 4) {
+                            src = pad + ci_abs * 4 * W_freq + kh * W_freq;
+                        } else {
+                            src = st->c0 + ci_abs * W_freq;
                         }
+                        float wval = wt[(ci * kH + kh) * kW];
+#if DFN3_SIMD
+                        v128_t vw = wasm_f32x4_splat(wval);
+                        int ow = 0;
+                        /* NB_DF=96 is divisible by 4 */
+                        for (; ow < (W_freq & ~3); ow += 4) {
+                            v128_t vs = wasm_v128_load(src + ow);
+                            v128_t vd = wasm_v128_load(dst + ow);
+                            wasm_v128_store(dst + ow, wasm_f32x4_add(vd, wasm_f32x4_mul(vw, vs)));
+                        }
+                        for (; ow < W_freq; ow++) {
+                            dst[ow] += src[ow] * wval;
+                        }
+#else
+                        for (int ow = 0; ow < W_freq; ow++) {
+                            dst[ow] += src[ow] * wval;
+                        }
+#endif
                     }
-                    dw_out[co_abs * W_freq + ow] = sum;
                 }
             }
         }
