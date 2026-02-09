@@ -176,8 +176,8 @@ class DFN3Worklet extends AudioWorkletProcessor {
             Module._free(wPtr);
 
             // Runtime parameters
-            Module._dfn3_wasm_set_atten_lim(80);           // max 80dB noise reduction
-            Module._dfn3_wasm_set_post_filter_beta(0.02);  // post-filter enabled
+            Module._dfn3_wasm_set_atten_lim(100);          // no attenuation limit
+            Module._dfn3_wasm_set_post_filter_beta(0);     // post-filter disabled
             Module._dfn3_wasm_set_min_db_thresh(-10);
             Module._dfn3_wasm_set_max_db_erb_thresh(30);
             Module._dfn3_wasm_set_max_db_df_thresh(20);
