@@ -176,7 +176,7 @@ Rust's [`realfft`](https://crates.io/crates/realfft)/[`rustfft`](https://crates.
 
 ---
 
-## Measured Performance
+## Measured Performance (WASM, not native)
 
 | Device | CPU | Time per frame | vs audio budget |
 |--------|-----|----------------|-----------------|

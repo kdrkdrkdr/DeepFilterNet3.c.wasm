@@ -66,7 +66,7 @@ void dfn3_wasm_set_max_db_df_thresh(float val);     // DF decoder upper bound
 void dfn3_wasm_destroy(void);
 ```
 
-## Performance
+## Performance (WASM)
 
 | Device | CPU | Time per frame |
 |--------|-----|----------------|
