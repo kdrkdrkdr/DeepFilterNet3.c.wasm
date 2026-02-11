@@ -72,6 +72,12 @@ static const int ERB_WIDTHS[NB_ERB] = {
     7, 8, 10, 12, 13, 15, 18, 20, 24, 28, 31, 37, 42, 50, 56, 67
 };
 
+/* First ERB band whose bins extend beyond NB_DF (96).
+   Bands 0-20 cover bins 0-92 (all within DF range 0-95).
+   When DF is active, ERB gains for these bands are overwritten → skip them. */
+#define ERB_DF_SKIP_BAND   21   /* first band to apply when DF is active */
+#define ERB_DF_SKIP_OFFSET 93   /* sum(ERB_WIDTHS[0..20]) = 93 bins */
+
 /* ---- FFT for N=960 using KissFFT ---- */
 /* KissFFT provides O(N log N) mixed-radix FFT.
    960 = 2^6 × 3 × 5 is supported natively by KissFFT's mixed-radix engine.
@@ -198,6 +204,11 @@ struct DFN3State {
 
     /* Silence detection */
     int silence_skip_counter;
+
+    /* Circular buffer head indices (oldest-slot pointer) */
+    int rolling_y_head;   /* rolling_spec_buf_y: 0..SPEC_BUF_Y_SIZE-1 */
+    int rolling_x_head;   /* rolling_spec_buf_x: 0..SPEC_BUF_X_SIZE-1 */
+    int df_convp_head;    /* df_convp_pad temporal: 0..3 */
 
     /* Scratch buffers */
     float scratch1[CONV_CH * FREQ_BINS];
@@ -342,7 +353,7 @@ static void dfn3_extract_erb(DFN3State* st) {
         energy /= w;  /* k = 1.0 / band_size */
 
         /* Convert to dB: 10 * log10(energy + 1e-10) */
-        float db = 10.0f * log10f(energy + 1e-10f);
+        float db = 10.0f * (dfn3_fast_log2f(energy + 1e-10f) * 0.30103f);
 
         /* band_mean_norm: state = x*(1-alpha) + state*alpha; x = (x - state)/40 */
         st->erb_norm_state[b] = db * (1.0f - alpha) + st->erb_norm_state[b] * alpha;
@@ -419,23 +430,18 @@ static void dfn3_encoder(DFN3State* st) {
         for (int co = 0; co < C_out; co++) {
             const float* wt = w->enc_erb_conv0_dw_w.data + co * C_in * kH * kW;
             float bias = w->enc_erb_conv0_dw_b.data[co];
-            for (int ow = 0; ow < W_in; ow++) {
-                float sum = bias;
-                for (int kh = 0; kh < kH; kh++) {
-                    const float* src;
-                    if (kh < 2) {
-                        src = pad + kh * W_in;
-                    } else {
-                        src = st->feat_erb;
-                    }
-                    for (int kw = 0; kw < kW; kw++) {
-                        int iw = ow + kw - freq_pad;
-                        float val = (iw >= 0 && iw < W_in) ? src[iw] : 0.0f;
-                        sum += val * wt[kh * kW + kw];
-                    }
-                }
-                st->e0[co * W_in + ow] = dfn3_relu(sum);
+            float* out_c = st->e0 + co * W_in;
+            /* Init with bias */
+            for (int i = 0; i < W_in; i++) out_c[i] = bias;
+            /* Accumulate kH=3 temporal rows using SIMD stride-1 kernel */
+            for (int kh = 0; kh < kH; kh++) {
+                const float* src = (kh < 2) ? (pad + kh * W_in) : st->feat_erb;
+                const float* wk = wt + kh * kW;
+                dfn3_dw_row_k3s1_accum(out_c, src, wk[0], wk[1], wk[2], W_in);
             }
+            /* ReLU in-place */
+            for (int i = 0; i < W_in; i++)
+                out_c[i] = out_c[i] > 0.0f ? out_c[i] : 0.0f;
         }
 
         /* Update pad: shift left, store current frame */
@@ -449,15 +455,10 @@ static void dfn3_encoder(DFN3State* st) {
         int W_out = NB_ERB / 2;  /* 16 */
         for (int c = 0; c < CONV_CH; c++) {
             const float* wt = w->enc_erb_conv1_dw_w.data + c * 3;
-            for (int ow = 0; ow < W_out; ow++) {
-                float sum = 0.0f;
-                for (int kw = 0; kw < 3; kw++) {
-                    int iw = ow * 2 + kw - 1;
-                    float val = (iw >= 0 && iw < W_in) ? st->e0[c * W_in + iw] : 0.0f;
-                    sum += val * wt[kw];
-                }
-                st->scratch1[c * W_out + ow] = sum;
-            }
+            float* out_c = st->scratch1 + c * W_out;
+            memset(out_c, 0, W_out * sizeof(float));
+            dfn3_dw_row_k3s2_accum(out_c, st->e0 + c * W_in,
+                                   wt[0], wt[1], wt[2], W_in);
         }
         dfn3_pointwise_conv2d(st->e1, st->scratch1,
                               w->enc_erb_conv1_pw_w.data,
@@ -472,15 +473,10 @@ static void dfn3_encoder(DFN3State* st) {
         int W_out = NB_ERB / 4;  /* 8 */
         for (int c = 0; c < CONV_CH; c++) {
             const float* wt = w->enc_erb_conv2_dw_w.data + c * 3;
-            for (int ow = 0; ow < W_out; ow++) {
-                float sum = 0.0f;
-                for (int kw = 0; kw < 3; kw++) {
-                    int iw = ow * 2 + kw - 1;
-                    float val = (iw >= 0 && iw < W_in) ? st->e1[c * W_in + iw] : 0.0f;
-                    sum += val * wt[kw];
-                }
-                st->scratch1[c * W_out + ow] = sum;
-            }
+            float* out_c = st->scratch1 + c * W_out;
+            memset(out_c, 0, W_out * sizeof(float));
+            dfn3_dw_row_k3s2_accum(out_c, st->e1 + c * W_in,
+                                   wt[0], wt[1], wt[2], W_in);
         }
         dfn3_pointwise_conv2d(st->e2, st->scratch1,
                               w->enc_erb_conv2_pw_w.data,
@@ -494,15 +490,10 @@ static void dfn3_encoder(DFN3State* st) {
         int W_io = NB_ERB / 4;  /* 8 */
         for (int c = 0; c < CONV_CH; c++) {
             const float* wt = w->enc_erb_conv3_dw_w.data + c * 3;
-            for (int ow = 0; ow < W_io; ow++) {
-                float sum = 0.0f;
-                for (int kw = 0; kw < 3; kw++) {
-                    int iw = ow + kw - 1;
-                    float val = (iw >= 0 && iw < W_io) ? st->e2[c * W_io + iw] : 0.0f;
-                    sum += val * wt[kw];
-                }
-                st->scratch1[c * W_io + ow] = sum;
-            }
+            float* out_c = st->scratch1 + c * W_io;
+            memset(out_c, 0, W_io * sizeof(float));
+            dfn3_dw_row_k3s1_accum(out_c, st->e2 + c * W_io,
+                                   wt[0], wt[1], wt[2], W_io);
         }
         dfn3_pointwise_conv2d(st->e3, st->scratch1,
                               w->enc_erb_conv3_pw_w.data,
@@ -531,23 +522,15 @@ static void dfn3_encoder(DFN3State* st) {
             for (int co = 0; co < C_out_per_group; co++) {
                 int co_abs = g * C_out_per_group + co;
                 const float* wt = w->enc_df_conv0_dw_w.data + co_abs * kH * kW;
-
-                for (int ow = 0; ow < W_in; ow++) {
-                    float sum = 0.0f;
-                    for (int kh = 0; kh < kH; kh++) {
-                        const float* src;
-                        if (kh < 2) {
-                            src = pad + g * 2 * W_in + kh * W_in;
-                        } else {
-                            src = st->feat_spec + g * W_in;
-                        }
-                        for (int kw = 0; kw < kW; kw++) {
-                            int iw = ow + kw - freq_pad;
-                            float val = (iw >= 0 && iw < W_in) ? src[iw] : 0.0f;
-                            sum += val * wt[kh * kW + kw];
-                        }
-                    }
-                    st->c0[co_abs * W_in + ow] = sum;
+                float* out_c = st->c0 + co_abs * W_in;
+                memset(out_c, 0, W_in * sizeof(float));
+                for (int kh = 0; kh < kH; kh++) {
+                    const float* src = (kh < 2)
+                        ? (pad + g * 2 * W_in + kh * W_in)
+                        : (st->feat_spec + g * W_in);
+                    const float* wk = wt + kh * kW;
+                    dfn3_dw_row_k3s1_accum(out_c, src,
+                                           wk[0], wk[1], wk[2], W_in);
                 }
             }
         }
@@ -578,18 +561,13 @@ static void dfn3_encoder(DFN3State* st) {
         int W_in = NB_DF;       /* 96 */
         int W_out = NB_DF / 2;  /* 48 */
 
-        /* Depthwise conv */
+        /* Depthwise conv - SIMD stride-2 */
         for (int c = 0; c < CONV_CH; c++) {
             const float* wt = w->enc_df_conv1_dw_w.data + c * 3;
-            for (int ow = 0; ow < W_out; ow++) {
-                float sum = 0.0f;
-                for (int kw = 0; kw < 3; kw++) {
-                    int iw = ow * 2 + kw - 1;
-                    float val = (iw >= 0 && iw < W_in) ? st->c0[c * W_in + iw] : 0.0f;
-                    sum += val * wt[kw];
-                }
-                st->scratch1[c * W_out + ow] = sum;
-            }
+            float* out_c = st->scratch1 + c * W_out;
+            memset(out_c, 0, W_out * sizeof(float));
+            dfn3_dw_row_k3s2_accum(out_c, st->c0 + c * W_in,
+                                   wt[0], wt[1], wt[2], W_in);
         }
 
         /* Pointwise conv [64,64,1,1] + bias + ReLU */
@@ -737,15 +715,10 @@ static void dfn3_erb_decoder(DFN3State* st) {
         int W_io = 8;
         for (int c = 0; c < CONV_CH; c++) {
             const float* wt = w->erb_convt3_dw_w.data + c * 3;
-            for (int ow = 0; ow < W_io; ow++) {
-                float sum = 0.0f;
-                for (int kw = 0; kw < 3; kw++) {
-                    int iw = ow + kw - 1;
-                    float val = (iw >= 0 && iw < W_io) ? st->scratch1[c * W_io + iw] : 0.0f;
-                    sum += val * wt[kw];
-                }
-                st->scratch2[c * W_io + ow] = sum;
-            }
+            float* out_c = st->scratch2 + c * W_io;
+            memset(out_c, 0, W_io * sizeof(float));
+            dfn3_dw_row_k3s1_accum(out_c, st->scratch1 + c * W_io,
+                                   wt[0], wt[1], wt[2], W_io);
         }
         dfn3_pointwise_conv2d(st->scratch1, st->scratch2,
                               w->erb_convt3_pw_w.data,
@@ -864,18 +837,17 @@ static void dfn3_erb_decoder(DFN3State* st) {
     {
         const float* wt = w->erb_conv0_out_w.data; /* [1, 64, 1, 3] */
         float b = w->erb_conv0_out_b.data[0];
-        for (int ow = 0; ow < NB_ERB; ow++) {
-            float sum = b;
-            for (int ci = 0; ci < CONV_CH; ci++) {
-                const float* w_ci = wt + ci * 3;
-                for (int kw = 0; kw < 3; kw++) {
-                    int iw = ow + kw - 1;
-                    float val = (iw >= 0 && iw < NB_ERB) ? st->scratch2[ci * NB_ERB + iw] : 0.0f;
-                    sum += val * w_ci[kw];
-                }
-            }
-            st->erb_mask[ow] = dfn3_sigmoid(sum);
+        /* Init with bias */
+        for (int i = 0; i < NB_ERB; i++) st->erb_mask[i] = b;
+        /* Accumulate all 64 channels using SIMD stride-1 kernel */
+        for (int ci = 0; ci < CONV_CH; ci++) {
+            const float* w_ci = wt + ci * 3;
+            dfn3_dw_row_k3s1_accum(st->erb_mask, st->scratch2 + ci * NB_ERB,
+                                   w_ci[0], w_ci[1], w_ci[2], NB_ERB);
         }
+        /* Sigmoid */
+        for (int i = 0; i < NB_ERB; i++)
+            st->erb_mask[i] = dfn3_sigmoid(st->erb_mask[i]);
     }
 }
 
@@ -936,7 +908,7 @@ static void dfn3_df_decoder(DFN3State* st) {
                        w->df_out_w.data,
                        16, 16, 60);
     for (int i = 0; i < NB_DF * DF_ORDER * 2; i++) {
-        coefs_gru[i] = tanhf(coefs_gru[i]); /* tanh is scalar — no SIMD */
+        coefs_gru[i] = dfn3_fast_tanh(coefs_gru[i]); /* bit-hack tanh */
     }
 
     /* ---- c0 pathway: df_convp ---- */
@@ -976,7 +948,9 @@ static void dfn3_df_decoder(DFN3State* st) {
                     for (int kh = 0; kh < kH; kh++) {
                         const float* src;
                         if (kh < 4) {
-                            src = pad + ci_abs * 4 * W_freq + kh * W_freq;
+                            /* Circular: logical kh → physical (head + kh) % 4 */
+                            int phys_kh = (st->df_convp_head + kh) & 3;
+                            src = pad + ci_abs * 4 * W_freq + phys_kh * W_freq;
                         } else {
                             src = st->c0 + ci_abs * W_freq;
                         }
@@ -1003,14 +977,15 @@ static void dfn3_df_decoder(DFN3State* st) {
             }
         }
 
-        /* Update temporal padding: shift left by 1, store current c0 */
-        for (int ci = 0; ci < C_in; ci++) {
-            memmove(pad + ci * 4 * W_freq,
-                    pad + ci * 4 * W_freq + W_freq,
-                    3 * W_freq * sizeof(float));
-            memcpy(pad + ci * 4 * W_freq + 3 * W_freq,
-                   st->c0 + ci * W_freq,
-                   W_freq * sizeof(float));
+        /* Update temporal padding: circular — write c0 to oldest slot, advance head */
+        {
+            int old_head = st->df_convp_head;
+            for (int ci = 0; ci < C_in; ci++) {
+                memcpy(pad + ci * 4 * W_freq + old_head * W_freq,
+                       st->c0 + ci * W_freq,
+                       W_freq * sizeof(float));
+            }
+            st->df_convp_head = (old_head + 1) & 3;
         }
 
         /* PW conv [10, 10, 1, 1] + bias + ReLU */
@@ -1036,14 +1011,20 @@ static void dfn3_df_decoder(DFN3State* st) {
     memcpy(coefs_combined, coefs_gru, NB_DF * 10 * sizeof(float));
     dfn3_vadd(coefs_combined, c0_proj, NB_DF * 10);
 
-    /* The coefs_combined are [96, 10] = [nb_df, df_order * 2]
-       Rust reshapes to [ch, nb_df, df_order, 2] where last 2 = [real, imag]
-       Memory layout: for each freq f, for each order n:
-         coefs[f * 10 + n * 2]     = real part
-         coefs[f * 10 + n * 2 + 1] = imag part */
-
-    /* Store in state for apply_df */
-    memcpy(st->scratch3, coefs_combined, NB_DF * DF_ORDER * 2 * sizeof(float));
+    /* Transpose coefs from [96, 10] = [freq, order*2] to [order, 2, 96] = [order, re/im, freq]
+       so that dfn3_apply_df can use contiguous SIMD loads instead of scatter gathers.
+       New layout: coefs[n * 192 + 0..95] = real for all freqs, coefs[n * 192 + 96..191] = imag */
+    {
+        float* dst = st->scratch3;
+        for (int n = 0; n < DF_ORDER; n++) {
+            float* dst_re = dst + n * (NB_DF * 2);
+            float* dst_im = dst_re + NB_DF;
+            for (int f = 0; f < NB_DF; f++) {
+                dst_re[f] = coefs_combined[f * 10 + n * 2];
+                dst_im[f] = coefs_combined[f * 10 + n * 2 + 1];
+            }
+        }
+    }
 }
 
 /* ---- Apply ERB mask to spectrum ---- */
@@ -1090,6 +1071,30 @@ static void dfn3_apply_erb_mask(DFN3State* st, float* enh_re, float* enh_im) {
    coefs layout: [nb_df, df_order * 2] = [96, 10]
    coefs[f][n] = Complex(coefs[f*10 + n*2], coefs[f*10 + n*2 + 1]) */
 
+/* ---- Circular rolling buffer helpers ---- */
+/* Write new spectrum to head slot (oldest), then advance head.
+   After return, head points to new oldest (was old [1]). */
+static void dfn3_rolling_push_circ(float buf[][2 * FREQ_BINS], int size,
+                                    int* head, const float* re, const float* im) {
+    float* dst = buf[*head];
+    memcpy(dst, re, FREQ_BINS * sizeof(float));
+    memcpy(dst + FREQ_BINS, im, FREQ_BINS * sizeof(float));
+    *head = (*head + 1) % size;
+}
+
+/* Map logical index (0=oldest, size-1=newest) to physical slot */
+static inline int dfn3_rbuf_phys(int head, int logical, int size) {
+    return (head + logical) % size;
+}
+
+/* Get re/im pointers from circular rolling buffer by logical index */
+static inline float* dfn3_rbuf_re_circ(float buf[][2 * FREQ_BINS], int head, int logical, int size) {
+    return buf[dfn3_rbuf_phys(head, logical, size)];
+}
+static inline float* dfn3_rbuf_im_circ(float buf[][2 * FREQ_BINS], int head, int logical, int size) {
+    return buf[dfn3_rbuf_phys(head, logical, size)] + FREQ_BINS;
+}
+
 static void dfn3_apply_df(DFN3State* st, float* enh_re, float* enh_im) {
     const float* coefs = st->scratch3;
 
@@ -1099,25 +1104,24 @@ static void dfn3_apply_df(DFN3State* st, float* enh_re, float* enh_im) {
 
     /* Iterate over DF frames: spec_iter.zip(coefs_arr.axis_iter(Axis(2)))
        coefs has df_order on axis 2, so zip takes min(spec.len(), df_order) = df_order frames.
-       Rust iterates spec from front (oldest) to back (newest). */
+       Rust iterates spec from front (oldest) to back (newest).
+       Circular: logical n → physical (head + n) % size */
+    /* Coefs are now transposed: [order, 2, 96] = coefs[n*192 + 0..95] = real, [n*192 + 96..191] = imag
+       This allows contiguous SIMD loads instead of scatter gathers (480 gathers eliminated). */
     for (int n = 0; n < DF_ORDER; n++) {
-        const float* frame_re = st->rolling_spec_buf_x[n];              /* re part */
-        const float* frame_im = st->rolling_spec_buf_x[n] + FREQ_BINS;  /* im part */
+        int phys = dfn3_rbuf_phys(st->rolling_x_head, n, SPEC_BUF_X_SIZE);
+        const float* frame_re = st->rolling_spec_buf_x[phys];              /* re part */
+        const float* frame_im = st->rolling_spec_buf_x[phys] + FREQ_BINS;  /* im part */
+        const float* coefs_re = coefs + n * (NB_DF * 2);         /* contiguous real[96] */
+        const float* coefs_im = coefs_re + NB_DF;                /* contiguous imag[96] */
 
 #if DFN3_SIMD
-        /* NB_DF=96 is divisible by 4, but coefs layout is strided: coefs[f*10 + n*2]
-           We must gather coefs (stride 10), spec is contiguous. */
+        /* All arrays contiguous → pure SIMD loads, no gathers needed */
         for (int f = 0; f < NB_DF; f += 4) {
-            /* Gather coefs: cr[k] = coefs[(f+k)*10 + n*2], ci[k] = coefs[(f+k)*10 + n*2 + 1] */
-            int base0 = f * 10 + n * 2;
-            v128_t vcr = wasm_f32x4_make(coefs[base0], coefs[base0 + 10],
-                                          coefs[base0 + 20], coefs[base0 + 30]);
-            v128_t vci = wasm_f32x4_make(coefs[base0 + 1], coefs[base0 + 11],
-                                          coefs[base0 + 21], coefs[base0 + 31]);
-            /* Load contiguous spec */
+            v128_t vcr = wasm_v128_load(coefs_re + f);
+            v128_t vci = wasm_v128_load(coefs_im + f);
             v128_t vsr = wasm_v128_load(frame_re + f);
             v128_t vsi = wasm_v128_load(frame_im + f);
-            /* Load current accumulators */
             v128_t ver = wasm_v128_load(enh_re + f);
             v128_t vei = wasm_v128_load(enh_im + f);
             /* Complex MAC: o += s * c
@@ -1131,11 +1135,10 @@ static void dfn3_apply_df(DFN3State* st, float* enh_re, float* enh_im) {
         }
 #else
         for (int f = 0; f < NB_DF; f++) {
-            float cr = coefs[f * 10 + n * 2];
-            float ci = coefs[f * 10 + n * 2 + 1];
+            float cr = coefs_re[f];
+            float ci = coefs_im[f];
             float sr = frame_re[f];
             float si = frame_im[f];
-            /* Complex multiply and accumulate: o += s * c */
             enh_re[f] += cr * sr - ci * si;
             enh_im[f] += cr * si + ci * sr;
         }
@@ -1173,21 +1176,19 @@ static void dfn3_post_filter(const float* noisy_re, const float* noisy_im,
         vg = wasm_f32x4_min(vg, vone);
         vg = wasm_f32x4_max(vg, veps);
 
-        /* sinf is scalar — extract, compute, re-pack */
-        float g[4], pf[4];
-        g[0] = wasm_f32x4_extract_lane(vg, 0);
-        g[1] = wasm_f32x4_extract_lane(vg, 1);
-        g[2] = wasm_f32x4_extract_lane(vg, 2);
-        g[3] = wasm_f32x4_extract_lane(vg, 3);
-
-        for (int k = 0; k < 4; k++) {
-            float gs = g[k] * sinf(g[k] * pi / 2.0f);
-            float ratio = g[k] / gs;
-            pf[k] = beta_p1 / (1.0f + beta * ratio * ratio);
-        }
-
-        /* Apply pf to enh_re, enh_im with SIMD */
-        v128_t vpf = wasm_f32x4_make(pf[0], pf[1], pf[2], pf[3]);
+        /* Full SIMD sinf + post-filter computation (no extract-lane) */
+        v128_t vpi_2 = wasm_f32x4_splat(pi / 2.0f);
+        v128_t vbeta = wasm_f32x4_splat(beta);
+        v128_t vbeta_p1 = wasm_f32x4_splat(beta_p1);
+        /* gs = g * sin(g * pi/2) */
+        v128_t vsin = dfn3_fast_sinf_v128(wasm_f32x4_mul(vg, vpi_2));
+        v128_t vgs = wasm_f32x4_mul(vg, vsin);
+        /* ratio = g / gs */
+        v128_t vratio = wasm_f32x4_div(vg, vgs);
+        /* pf = (beta+1) / (1 + beta * ratio²) */
+        v128_t vr2 = wasm_f32x4_mul(vratio, vratio);
+        v128_t vpf = wasm_f32x4_div(vbeta_p1,
+                                     wasm_f32x4_add(vone, wasm_f32x4_mul(vbeta, vr2)));
         wasm_v128_store(enh_re + i, wasm_f32x4_mul(ver, vpf));
         wasm_v128_store(enh_im + i, wasm_f32x4_mul(vei, vpf));
 #else
@@ -1204,7 +1205,7 @@ static void dfn3_post_filter(const float* noisy_re, const float* noisy_im,
         }
 
         for (int k = 0; k < 4; k++) {
-            float gs = g[k] * sinf(g[k] * pi / 2.0f);
+            float gs = g[k] * dfn3_fast_sinf(g[k] * pi / 2.0f);
             float ratio = g[k] / gs;
             pf[k] = beta_p1 / (1.0f + beta * ratio * ratio);
         }
@@ -1218,27 +1219,6 @@ static void dfn3_post_filter(const float* noisy_re, const float* noisy_im,
     }
     /* Remaining elements (if n_freqs % 4 != 0) are left unchanged,
        matching Rust chunks_exact behavior */
-}
-
-/* ---- Helper: shift rolling buffer left by 1 (pop_front) ---- */
-static void dfn3_rolling_shift(float buf[][2 * FREQ_BINS], int size) {
-    memmove(buf[0], buf[1], (size - 1) * 2 * FREQ_BINS * sizeof(float));
-}
-
-/* ---- Helper: push spectrum to back of rolling buffer ---- */
-static void dfn3_rolling_push(float buf[][2 * FREQ_BINS], int size,
-                               const float* re, const float* im) {
-    float* dst = buf[size - 1];
-    memcpy(dst, re, FREQ_BINS * sizeof(float));
-    memcpy(dst + FREQ_BINS, im, FREQ_BINS * sizeof(float));
-}
-
-/* ---- Helper: get re/im pointers from rolling buffer frame ---- */
-static const float* dfn3_rbuf_re(const float buf[][2 * FREQ_BINS], int idx) {
-    return buf[idx];
-}
-static const float* dfn3_rbuf_im(const float buf[][2 * FREQ_BINS], int idx) {
-    return buf[idx] + FREQ_BINS;
 }
 
 /* ---- Main process function ---- */
@@ -1265,18 +1245,14 @@ void dfn3_process(DFN3State* st, const float* in, float* out) {
         }
     }
 
-    /* 2. Rust lines 531-532: pop_front both rolling buffers */
-    dfn3_rolling_shift(st->rolling_spec_buf_y, SPEC_BUF_Y_SIZE);
-    dfn3_rolling_shift(st->rolling_spec_buf_x, SPEC_BUF_X_SIZE);
-
-    /* 3. STFT analysis (Rust lines 533-540) */
+    /* 2-4. STFT analysis + circular push (replaces shift+push with O(1) head advance) */
     dfn3_frame_analysis(st, in);
 
-    /* 4. Push new spectrum to back of both rolling buffers (Rust lines 541-542) */
-    dfn3_rolling_push(st->rolling_spec_buf_y, SPEC_BUF_Y_SIZE,
-                      st->spec_re, st->spec_im);
-    dfn3_rolling_push(st->rolling_spec_buf_x, SPEC_BUF_X_SIZE,
-                      st->spec_re, st->spec_im);
+    /* Overwrite oldest slot with new spectrum, advance head */
+    dfn3_rolling_push_circ(st->rolling_spec_buf_y, SPEC_BUF_Y_SIZE,
+                           &st->rolling_y_head, st->spec_re, st->spec_im);
+    dfn3_rolling_push_circ(st->rolling_spec_buf_x, SPEC_BUF_X_SIZE,
+                           &st->rolling_x_head, st->spec_re, st->spec_im);
 
     /* 5. Feature extraction — uses current frame spectrum (spec_re/im) */
     dfn3_extract_erb(st);
@@ -1319,18 +1295,23 @@ void dfn3_process(DFN3State* st, const float* in, float* out) {
         has_coefs = 1;
     }
 
-    /* 9. Apply gains to rolling_spec_buf_y[df_order - 1]
-       (Rust lines 551-583) */
+    /* 9. Apply gains to rolling_spec_buf_y[logical df_order - 1]
+       (Rust lines 551-583) — circular indexing */
     {
-        int delayed_idx = DF_ORDER - 1;  /* = 4 */
-        float* spec_y_re = st->rolling_spec_buf_y[delayed_idx];
-        float* spec_y_im = st->rolling_spec_buf_y[delayed_idx] + FREQ_BINS;
+        int delayed_logical = DF_ORDER - 1;  /* = 4 */
+        float* spec_y_re = dfn3_rbuf_re_circ(st->rolling_spec_buf_y,
+                                              st->rolling_y_head, delayed_logical, SPEC_BUF_Y_SIZE);
+        float* spec_y_im = dfn3_rbuf_im_circ(st->rolling_spec_buf_y,
+                                              st->rolling_y_head, delayed_logical, SPEC_BUF_Y_SIZE);
 
         if (has_gains) {
             /* Apply ERB mask in-place to rolling_spec_buf_y[df_order-1]
-               Rust: state.apply_mask(spec_ch, gain_slc) */
-            int offset = 0;
-            for (int b = 0; b < NB_ERB; b++) {
+               Rust: state.apply_mask(spec_ch, gain_slc)
+               Optimization: when DF is active, skip bands 0-20 (bins 0-92)
+               since dfn3_apply_df() will zero and overwrite bins 0-95 anyway. */
+            int start_band = has_coefs ? ERB_DF_SKIP_BAND : 0;
+            int offset = has_coefs ? ERB_DF_SKIP_OFFSET : 0;
+            for (int b = start_band; b < NB_ERB; b++) {
                 float gain = st->erb_mask[b];
                 int bw = ERB_WIDTHS[b];
 #if DFN3_SIMD
@@ -1369,9 +1350,13 @@ void dfn3_process(DFN3State* st, const float* in, float* out) {
        - If has_coefs, apply DF to overwrite bins 0..nb_df using rolling_spec_buf_x */
     float enh_re[FREQ_BINS], enh_im[FREQ_BINS];
     {
-        int delayed_idx = DF_ORDER - 1;
-        memcpy(enh_re, st->rolling_spec_buf_y[delayed_idx], FREQ_BINS * sizeof(float));
-        memcpy(enh_im, st->rolling_spec_buf_y[delayed_idx] + FREQ_BINS, FREQ_BINS * sizeof(float));
+        int delayed_logical = DF_ORDER - 1;
+        const float* src_re = dfn3_rbuf_re_circ(st->rolling_spec_buf_y,
+                                                 st->rolling_y_head, delayed_logical, SPEC_BUF_Y_SIZE);
+        const float* src_im = dfn3_rbuf_im_circ(st->rolling_spec_buf_y,
+                                                 st->rolling_y_head, delayed_logical, SPEC_BUF_Y_SIZE);
+        memcpy(enh_re, src_re, FREQ_BINS * sizeof(float));
+        memcpy(enh_im, src_im, FREQ_BINS * sizeof(float));
     }
 
     if (has_coefs) {
@@ -1380,13 +1365,15 @@ void dfn3_process(DFN3State* st, const float* in, float* out) {
     }
 
     /* 11. Post-filter (Rust lines 617-623)
-       Noisy reference = rolling_spec_buf_x[max(lookahead,df_order) - lookahead - 1]
-                       = rolling_spec_buf_x[max(2,5) - 2 - 1] = rolling_spec_buf_x[2]
+       Noisy reference = rolling_spec_buf_x[logical: max(lookahead,df_order) - lookahead - 1]
+                       = logical index 2 (5 - 2 - 1 = 2), circular indexing
        Only applies when apply_erb (= apply_gains) && post_filter_beta > 0 */
-    int noisy_idx = SPEC_BUF_X_SIZE - LOOKAHEAD - 1;  /* 5 - 2 - 1 = 2 */
+    int noisy_logical = SPEC_BUF_X_SIZE - LOOKAHEAD - 1;  /* 5 - 2 - 1 = 2 */
     if (apply_gains && st->post_filter_beta > 0.0f) {
-        const float* noisy_re = dfn3_rbuf_re(st->rolling_spec_buf_x, noisy_idx);
-        const float* noisy_im = dfn3_rbuf_im(st->rolling_spec_buf_x, noisy_idx);
+        const float* noisy_re = dfn3_rbuf_re_circ(st->rolling_spec_buf_x,
+                                                    st->rolling_x_head, noisy_logical, SPEC_BUF_X_SIZE);
+        const float* noisy_im = dfn3_rbuf_im_circ(st->rolling_spec_buf_x,
+                                                    st->rolling_x_head, noisy_logical, SPEC_BUF_X_SIZE);
         dfn3_post_filter(noisy_re, noisy_im,
                          enh_re, enh_im,
                          FREQ_BINS, st->post_filter_beta);
@@ -1395,8 +1382,10 @@ void dfn3_process(DFN3State* st, const float* in, float* out) {
     /* 11b. Attenuation limit (Rust lines 625-629)
        Mix back noisy signal: enh = enh * (1-lim) + noisy * lim */
     if (st->atten_lim > 0.0f) {
-        const float* noisy_re2 = dfn3_rbuf_re(st->rolling_spec_buf_x, noisy_idx);
-        const float* noisy_im2 = dfn3_rbuf_im(st->rolling_spec_buf_x, noisy_idx);
+        const float* noisy_re2 = dfn3_rbuf_re_circ(st->rolling_spec_buf_x,
+                                                     st->rolling_x_head, noisy_logical, SPEC_BUF_X_SIZE);
+        const float* noisy_im2 = dfn3_rbuf_im_circ(st->rolling_spec_buf_x,
+                                                     st->rolling_x_head, noisy_logical, SPEC_BUF_X_SIZE);
         float one_m_lim = 1.0f - st->atten_lim;
         for (int i = 0; i < FREQ_BINS; i++) {
             enh_re[i] = enh_re[i] * one_m_lim + noisy_re2[i] * st->atten_lim;
