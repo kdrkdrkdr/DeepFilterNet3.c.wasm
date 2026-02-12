@@ -25,7 +25,7 @@ emcc dfn3_wasm.c kiss_fft.c kiss_fftr.c \
     -s WASM=1 \
     -s MODULARIZE=1 \
     -s EXPORT_NAME="createDFN3Module" \
-    -s EXPORTED_FUNCTIONS='["_dfn3_wasm_create","_dfn3_wasm_get_input_ptr","_dfn3_wasm_get_output_ptr","_dfn3_wasm_get_input_size","_dfn3_wasm_get_output_size","_dfn3_wasm_process","_dfn3_wasm_get_lsnr","_dfn3_wasm_set_atten_lim","_dfn3_wasm_set_post_filter_beta","_dfn3_wasm_set_min_db_thresh","_dfn3_wasm_set_max_db_erb_thresh","_dfn3_wasm_set_max_db_df_thresh","_dfn3_wasm_destroy","_malloc","_free"]' \
+    -s EXPORTED_FUNCTIONS='["_dfn3_wasm_create","_dfn3_wasm_get_input_ptr","_dfn3_wasm_get_output_ptr","_dfn3_wasm_get_input_size","_dfn3_wasm_get_output_size","_dfn3_wasm_process","_dfn3_wasm_get_lsnr","_dfn3_wasm_set_atten_lim","_dfn3_wasm_set_post_filter_beta","_dfn3_wasm_set_min_db_thresh","_dfn3_wasm_set_max_db_erb_thresh","_dfn3_wasm_set_max_db_df_thresh","_dfn3_wasm_destroy","_dfn3_wasm_agc_init","_dfn3_wasm_set_input_agc","_dfn3_wasm_set_output_agc","_dfn3_wasm_set_agc_target","_dfn3_wasm_set_agc_compression","_dfn3_wasm_set_input_agc_compression","_dfn3_wasm_set_output_agc_compression","_dfn3_wasm_set_hpf","_malloc","_free"]' \
     -s EXPORTED_RUNTIME_METHODS='["ccall","cwrap","HEAPF32","HEAPU8"]' \
     -s ALLOW_MEMORY_GROWTH=0 \
     -s INITIAL_MEMORY=67108864 \
@@ -181,6 +181,16 @@ class DFN3Worklet extends AudioWorkletProcessor {
             Module._dfn3_wasm_set_min_db_thresh(-10);
             Module._dfn3_wasm_set_max_db_erb_thresh(30);
             Module._dfn3_wasm_set_max_db_df_thresh(20);
+
+            // High-pass filter: 80Hz 저주파 컷 (기본 ON)
+            Module._dfn3_wasm_set_hpf(1);
+
+            // Initialize and enable WASM AGC (replaces browser autoGainControl)
+            Module._dfn3_wasm_agc_init();
+            Module._dfn3_wasm_set_input_agc(1);
+            Module._dfn3_wasm_set_output_agc(1);
+            Module._dfn3_wasm_set_input_agc_compression(12);   // 입력: 12dB (~4x) — 보수적, 노이즈 증폭 방지
+            Module._dfn3_wasm_set_output_agc_compression(18);  // 출력: 18dB (~8x) — 공격적, DFN3 후 깨끗한 음성 복원
 
             this.ready = true;
             this.port.postMessage('ready');
